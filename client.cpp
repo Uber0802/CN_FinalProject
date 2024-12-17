@@ -1,3 +1,4 @@
+// client.cpp
 #include <iostream>
 #include <string>
 #include <cstring>
@@ -15,7 +16,7 @@ using namespace std;
 bool logged_in = false;
 bool interacting_with_server = false;
 
-// Condition variable to coordinate printing the menu
+// Synchronization for menu printing
 mutex mtx;
 condition_variable cv;
 
@@ -40,18 +41,18 @@ void receive_messages(int sock) {
 
         string message(buffer);
 
-        // Check for relayed client-to-client messages
+        // Relay from another client
         if (message.rfind("MSG:", 0) == 0) {
             if (!interacting_with_server) {
                 cout << "\n[Message Received]: " << message.substr(4) << endl;
             }
         }
-        // Server messages
         else if (message.rfind("SERVER:", 0) == 0) {
-            string server_message = message.substr(7); // remove "SERVER: "
+            // Server messages or prompts
+            string server_message = message.substr(7);
             cout << "Server: " << server_message << endl;
 
-            // Decide how to handle server messages
+            // Check triggers
             if (server_message.find("Logged out successfully.") != string::npos) {
                 logged_in = false;
                 signal_interaction_finished();
@@ -89,24 +90,21 @@ void receive_messages(int sock) {
                 getline(cin, target_user);
                 send(sock, target_user.c_str(), target_user.size(), 0);
 
-                // Read server’s next response
                 memset(buffer, 0, sizeof(buffer));
                 int read_count = read(sock, buffer, 1024);
                 if (read_count > 0) {
-                    string next_message(buffer);
-                    cout << next_message << endl; 
-
-                    if (next_message.find("User not found or not online.") != string::npos) {
+                    string next_msg(buffer);
+                    cout << next_msg << endl;  // Could be "SERVER: Enter your message:" or error
+                    if (next_msg.find("User not found or not online.") != string::npos) {
                         signal_interaction_finished();
                         continue;
                     }
-                    else if (next_message.find("Enter your message:") != string::npos) {
+                    else if (next_msg.find("Enter your message:") != string::npos) {
                         string msg;
                         getline(cin, msg);
                         send(sock, msg.c_str(), msg.size(), 0);
                         signal_interaction_finished();
-                    }
-                    else {
+                    } else {
                         signal_interaction_finished();
                     }
                 } else {
@@ -120,9 +118,6 @@ void receive_messages(int sock) {
                 signal_interaction_finished();
             }
             else if (server_message.find("Invalid option.") != string::npos) {
-                signal_interaction_finished();
-            }
-            else if (server_message.find("You must log in to send messages.") != string::npos) {
                 signal_interaction_finished();
             }
         }
@@ -151,6 +146,7 @@ int main() {
         return -1;
     }
 
+    // Thread to receive server messages
     thread listener(receive_messages, sock);
     listener.detach();
 
@@ -166,7 +162,7 @@ int main() {
             cout << "2. Login\n";
             cout << "3. Exit\n";
         } else {
-            // Modified: no “Register” after log in
+            // No register after login
             cout << "1. Logout\n";
             cout << "2. Send Message\n";
             cout << "3. Exit\n";
@@ -176,24 +172,20 @@ int main() {
         getline(cin, choice);
         send(sock, choice.c_str(), choice.size(), 0);
 
-        // If user selects Exit
+        // If user selects exit
         if ((!logged_in && choice == "3") || (logged_in && choice == "3")) {
-            // Notice that if logged_in==true, now "3" means "Exit"
             cout << "Exiting...\n";
             break;
         }
 
-        // If the user is logged out: 1=Register, 2=Login
-        // If the user is logged in: 1=Logout, 2=SendMessage
-        // We set interacting_with_server if it’s an action that triggers server prompts
         if (!logged_in) {
-            // Register = "1", Login = "2"
+            // Not logged in: 1=Register, 2=Login
             if (choice == "1" || choice == "2") {
                 lock_guard<mutex> lock(mtx);
                 interacting_with_server = true;
             }
         } else {
-            // Logout = "1", Send Message = "2"
+            // Logged in: 1=Logout, 2=SendMessage
             if (choice == "1" || choice == "2") {
                 lock_guard<mutex> lock(mtx);
                 interacting_with_server = true;
