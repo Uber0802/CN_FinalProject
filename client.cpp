@@ -1,3 +1,4 @@
+// client.cpp
 #include <iostream>
 #include <string>
 #include <cstring>
@@ -8,9 +9,26 @@
 
 #define PORT 8080
 
-using namespace std; // Explicitly include the std namespace
+using namespace std;
 
 bool logged_in = false;
+bool interacting_with_server = false;
+
+// Include threading and synchronization
+#include <mutex>
+#include <condition_variable>
+mutex mtx;
+condition_variable cv;
+
+// Utility function for the receive thread to let the main loop know: 
+// "Done interacting with the server — it's safe to show the menu again."
+void signal_interaction_finished() {
+    {
+        lock_guard<mutex> lock(mtx);
+        interacting_with_server = false;
+    }
+    cv.notify_one();
+}
 
 void receive_messages(int sock) {
     char buffer[1024] = {0};
@@ -18,42 +36,87 @@ void receive_messages(int sock) {
     while (true) {
         memset(buffer, 0, sizeof(buffer));
         int bytes_read = read(sock, buffer, 1024);
-        if (bytes_read > 0) {
-            string message(buffer);
+        if (bytes_read <= 0) {
+            // Server closed connection or error
+            close(sock);
+            break;
+        }
 
-            if (message.rfind("MSG:", 0) == 0) { // Relayed message from another client
+        string message(buffer);
+
+        if (message.rfind("MSG:", 0) == 0) {
+            // Relay (private) message from another client
+            // If desired, we can block it if interacting_with_server == true
+            if (!interacting_with_server) {
                 cout << "\n[Message Received]: " << message.substr(4) << endl;
-            } else if (message.rfind("SERVER:", 0) == 0) { // Server interaction messages
-                string server_message = message.substr(7);
-                cout << "Server: " << server_message << endl;
-
-                if (server_message.find("Logged out successfully.") != string::npos) {
-                    logged_in = false;
-                } else if (server_message.find("Please enter your username and password") != string::npos) {
-                    string credentials;
-                    cout << "Enter <username> <password>: ";
-                    getline(cin, credentials);
-                    send(sock, credentials.c_str(), credentials.size(), 0);
-                } else if (server_message.find("Online users:") != string::npos) {
-                    cout << "Choose a user to send a message to: ";
-                    string target_user;
-                    getline(cin, target_user);
-                    send(sock, target_user.c_str(), target_user.size(), 0);
-
-                    // Wait for server prompt to send the message
-                    memset(buffer, 0, sizeof(buffer));
-                    bytes_read = read(sock, buffer, 1024);
-                    if (bytes_read > 0) {
-                        string response(buffer);
-                        cout << response << endl;
-
-                        string message_to_send;
-                        cout << "Enter your message: ";
-                        getline(cin, message_to_send);
-                        send(sock, message_to_send.c_str(), message_to_send.size(), 0);
-                    }
-                }
             }
+        } 
+        else if (message.rfind("SERVER:", 0) == 0) {
+            // Server-side messages / prompts
+            string server_message = message.substr(7); // Remove "SERVER: "
+
+            cout << "Server: " << server_message << endl;
+
+            // Check for triggers:
+            if (server_message.find("Logged out successfully.") != string::npos) {
+                logged_in = false;
+                signal_interaction_finished();
+            }
+            else if (server_message.find("Registration successful.") != string::npos) {
+                // Done with registration interaction
+                signal_interaction_finished();
+            }
+            else if (server_message.find("Login successful.") != string::npos) {
+                logged_in = true;
+                signal_interaction_finished();
+            }
+            else if (server_message.find("Login failed: incorrect username or password.") != string::npos) {
+                // The server gave a failure message
+                signal_interaction_finished();
+            }
+            else if (server_message.find("Username already exists.") != string::npos) {
+                // Registration failed
+                signal_interaction_finished();
+            }
+            else if (server_message.find("Please enter your username and password") != string::npos) {
+                // Server is requesting credentials — let's get them
+                {
+                    lock_guard<mutex> lock(mtx);
+                    interacting_with_server = true;
+                }
+
+                string credentials;
+                cout << "Enter <username> <password>: ";
+                getline(cin, credentials);
+                send(sock, credentials.c_str(), credentials.size(), 0);
+
+                // We'll wait for “Registration successful” or “Login successful” in the receive thread
+            }
+            else if (server_message.find("Online users:") != string::npos) {
+                // The server wants us to pick a target user — mark interacting true
+                {
+                    lock_guard<mutex> lock(mtx);
+                    interacting_with_server = true;
+                }
+                cout << "Choose a user to send a message to: ";
+                string target_user;
+                getline(cin, target_user);
+                send(sock, target_user.c_str(), target_user.size(), 0);
+
+                // Wait for server prompt to send the actual message
+                memset(buffer, 0, sizeof(buffer));
+                int read_count = read(sock, buffer, 1024);
+                if (read_count > 0) {
+                    string prompt(buffer);
+                    cout << prompt << endl;  // e.g. "SERVER: Enter your message:"
+                    string message_to_send;
+                    getline(cin, message_to_send);
+                    send(sock, message_to_send.c_str(), message_to_send.size(), 0);
+                }
+                signal_interaction_finished();
+            }
+            // If server says "Invalid option." or "No other users are online." — no user input
+            // needed afterwards, so we can stay unlocked. But it's okay if the code stands as is.
         }
     }
 }
@@ -80,11 +143,18 @@ int main() {
         return -1;
     }
 
-    // Start a thread to handle receiving messages
+    // Start a thread to handle receiving messages from server
     thread listener(receive_messages, sock);
     listener.detach();
 
     while (true) {
+        // Wait until we're not interacting
+        {
+            unique_lock<mutex> lock(mtx);
+            cv.wait(lock, [] { return !interacting_with_server; });
+        }
+
+        // Print the main menu
         cout << "\nSelect a service:\n";
         if (!logged_in) {
             cout << "1. Register\n";
@@ -100,14 +170,24 @@ int main() {
         string choice;
         getline(cin, choice);
 
+        // Send the choice to the server
         send(sock, choice.c_str(), choice.size(), 0);
 
-        if (choice == "3" && !logged_in) { // Exit when not logged in
+        // If user wants to exit
+        if ((!logged_in && choice == "3") || (logged_in && choice == "4")) {
             cout << "Exiting...\n";
             break;
-        } else if (choice == "4" && logged_in) { // Exit when logged in
-            cout << "Exiting...\n";
-            break;
+        }
+
+        // If the choice is one that leads to a server prompt (Register / Login / Logout / SendMessage)
+        // then immediately set interacting_with_server so we don’t reprint the menu prematurely.
+        if ((choice == "1" && !logged_in) ||  // Register
+            (choice == "2" && !logged_in) ||  // Login
+            (choice == "2" && logged_in)  ||  // Logout
+            (choice == "3" && logged_in))     // Send Message
+        {
+            lock_guard<mutex> lock(mtx);
+            interacting_with_server = true;
         }
     }
 
