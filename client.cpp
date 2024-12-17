@@ -6,6 +6,8 @@
 #include <sys/socket.h>
 #include <arpa/inet.h>
 #include <unistd.h>
+#include <mutex>
+#include <condition_variable>
 
 #define PORT 8080
 
@@ -14,14 +16,11 @@ using namespace std;
 bool logged_in = false;
 bool interacting_with_server = false;
 
-// Include threading and synchronization
-#include <mutex>
-#include <condition_variable>
+// Condition variable to coordinate with main loop
 mutex mtx;
 condition_variable cv;
 
-// Utility function for the receive thread to let the main loop know: 
-// "Done interacting with the server — it's safe to show the menu again."
+// Called by receive thread to unlock main loop (so it can print the menu again)
 void signal_interaction_finished() {
     {
         lock_guard<mutex> lock(mtx);
@@ -44,34 +43,32 @@ void receive_messages(int sock) {
 
         string message(buffer);
 
+        // Check for relayed client-to-client messages
         if (message.rfind("MSG:", 0) == 0) {
-            // Relay (private) message from another client
-            // If desired, we can block it if interacting_with_server == true
+            // If not in the middle of a server prompt, display the message
             if (!interacting_with_server) {
                 cout << "\n[Message Received]: " << message.substr(4) << endl;
             }
-        } 
+        }
+        // Else it's a server message or prompt
         else if (message.rfind("SERVER:", 0) == 0) {
-            // Server-side messages / prompts
             string server_message = message.substr(7); // Remove "SERVER: "
-
             cout << "Server: " << server_message << endl;
 
-            // Check for triggers:
+            // Check for success/failure triggers:
             if (server_message.find("Logged out successfully.") != string::npos) {
                 logged_in = false;
                 signal_interaction_finished();
             }
             else if (server_message.find("Registration successful.") != string::npos) {
-                // Done with registration interaction
                 signal_interaction_finished();
             }
             else if (server_message.find("Login successful.") != string::npos) {
                 logged_in = true;
                 signal_interaction_finished();
             }
-            else if (server_message.find("Login failed: incorrect username or password.") != string::npos) {
-                // The server gave a failure message
+            else if (server_message.find("Login failed:") != string::npos) {
+                // incorrect username/password or already logged in
                 signal_interaction_finished();
             }
             else if (server_message.find("Username already exists.") != string::npos) {
@@ -79,21 +76,18 @@ void receive_messages(int sock) {
                 signal_interaction_finished();
             }
             else if (server_message.find("Please enter your username and password") != string::npos) {
-                // Server is requesting credentials — let's get them
+                // The server is requesting credentials
                 {
                     lock_guard<mutex> lock(mtx);
                     interacting_with_server = true;
                 }
-
                 string credentials;
                 cout << "Enter <username> <password>: ";
                 getline(cin, credentials);
                 send(sock, credentials.c_str(), credentials.size(), 0);
-
-                // We'll wait for “Registration successful” or “Login successful” in the receive thread
             }
             else if (server_message.find("Online users:") != string::npos) {
-                // The server wants us to pick a target user — mark interacting true
+                // Begin the "Send Message" flow
                 {
                     lock_guard<mutex> lock(mtx);
                     interacting_with_server = true;
@@ -103,20 +97,49 @@ void receive_messages(int sock) {
                 getline(cin, target_user);
                 send(sock, target_user.c_str(), target_user.size(), 0);
 
-                // Wait for server prompt to send the actual message
+                // Server will respond with either "SERVER: User not found..." or "SERVER: Enter your message:"
                 memset(buffer, 0, sizeof(buffer));
                 int read_count = read(sock, buffer, 1024);
                 if (read_count > 0) {
-                    string prompt(buffer);
-                    cout << prompt << endl;  // e.g. "SERVER: Enter your message:"
-                    string message_to_send;
-                    getline(cin, message_to_send);
-                    send(sock, message_to_send.c_str(), message_to_send.size(), 0);
+                    string next_message(buffer);
+                    cout << next_message << endl; // e.g. "SERVER: Enter your message:" or "SERVER: User not found..."
+
+                    if (next_message.find("User not found or not online.") != string::npos) {
+                        // Immediately show menu again
+                        signal_interaction_finished();
+                        continue;
+                    }
+                    else if (next_message.find("Enter your message:") != string::npos) {
+                        string msg;
+                        getline(cin, msg);
+                        send(sock, msg.c_str(), msg.size(), 0);
+                        signal_interaction_finished();
+                    }
+                    else {
+                        // Some other unexpected server response
+                        signal_interaction_finished();
+                    }
+                } else {
+                    // If the read failed, just signal
+                    signal_interaction_finished();
                 }
+            }
+            else if (server_message.find("User not found or not online.") != string::npos) {
+                // Server reports error, no more input required
                 signal_interaction_finished();
             }
-            // If server says "Invalid option." or "No other users are online." — no user input
-            // needed afterwards, so we can stay unlocked. But it's okay if the code stands as is.
+            else if (server_message.find("No other users are online.") != string::npos) {
+                signal_interaction_finished();
+            }
+            else if (server_message.find("Invalid option.") != string::npos) {
+                signal_interaction_finished();
+            }
+            else if (server_message.find("You must log in to send messages.") != string::npos) {
+                // Let user pick another menu option
+                signal_interaction_finished();
+            }
+            // If server says "Exiting..." or something else that doesn't require further input:
+            // optionally call signal_interaction_finished() too if you want an immediate menu reprint
         }
     }
 }
@@ -143,18 +166,17 @@ int main() {
         return -1;
     }
 
-    // Start a thread to handle receiving messages from server
+    // Start thread to receive server messages
     thread listener(receive_messages, sock);
     listener.detach();
 
     while (true) {
-        // Wait until we're not interacting
+        // Wait until the client is not interacting
         {
             unique_lock<mutex> lock(mtx);
             cv.wait(lock, [] { return !interacting_with_server; });
         }
 
-        // Print the main menu
         cout << "\nSelect a service:\n";
         if (!logged_in) {
             cout << "1. Register\n";
@@ -170,7 +192,7 @@ int main() {
         string choice;
         getline(cin, choice);
 
-        // Send the choice to the server
+        // Send user choice to server
         send(sock, choice.c_str(), choice.size(), 0);
 
         // If user wants to exit
@@ -179,8 +201,7 @@ int main() {
             break;
         }
 
-        // If the choice is one that leads to a server prompt (Register / Login / Logout / SendMessage)
-        // then immediately set interacting_with_server so we don’t reprint the menu prematurely.
+        // Immediately set interacting_with_server if it's an action requiring server interaction
         if ((choice == "1" && !logged_in) ||  // Register
             (choice == "2" && !logged_in) ||  // Login
             (choice == "2" && logged_in)  ||  // Logout
@@ -194,3 +215,4 @@ int main() {
     close(sock);
     return 0;
 }
+
