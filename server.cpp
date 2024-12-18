@@ -2,13 +2,13 @@
 #include <iostream>
 #include <string>
 #include <unordered_map>
-#include <vector>
 #include <cstring>
 #include <queue>
 #include <pthread.h>
 #include <sys/socket.h>
 #include <arpa/inet.h>
 #include <unistd.h>
+#include <cctype>
 
 #define PORT 8080
 #define MAX_WORKERS 10
@@ -16,190 +16,255 @@
 
 using namespace std;
 
-// Global data
-unordered_map<string, string> users;          // username -> password
-unordered_map<string, int> logged_in_clients; // username -> socket
+struct UserInfo {
+    string password;
+    bool logged_in = false;
+    int sock = -1;
+    string ip;
+    int direct_port = -1;
+};
+
+unordered_map<string, UserInfo> users;         
+unordered_map<string, int> logged_in_clients;
 queue<int> client_queue;
 pthread_mutex_t queue_mutex = PTHREAD_MUTEX_INITIALIZER;
 pthread_cond_t condition_var = PTHREAD_COND_INITIALIZER;
 
-// handle_client function with log statements
+static inline void rtrim(string &s) {
+    while (!s.empty() && isspace((unsigned char)s.back())) {
+        s.pop_back();
+    }
+}
+
 void handle_client(int client_socket) {
     char buffer[1024] = {0};
     bool is_logged_in = false;
     string current_user;
 
+    struct sockaddr_in addr;
+    socklen_t addr_len = sizeof(addr);
+    getpeername(client_socket, (struct sockaddr*)&addr, &addr_len);
+    char client_ip[INET_ADDRSTRLEN];
+    inet_ntop(AF_INET, &addr.sin_addr, client_ip, INET_ADDRSTRLEN);
+
     while (true) {
         memset(buffer, 0, sizeof(buffer));
         int bytes_read = read(client_socket, buffer, 1024);
 
-        // Client disconnected or error
         if (bytes_read <= 0) {
             if (is_logged_in) {
                 pthread_mutex_lock(&queue_mutex);
+                users[current_user].logged_in = false;
                 logged_in_clients.erase(current_user);
                 pthread_mutex_unlock(&queue_mutex);
-                // No explicit logout message, but user might have closed the client.
             }
             close(client_socket);
             break;
         }
 
         string message(buffer);
-        message = message.substr(0, message.find("\n")); // strip newline
+        message = message.substr(0, message.find("\n"));
+        rtrim(message);
+
+        if (is_logged_in && message.rfind("DIRECT_PORT:", 0) == 0) {
+            int port = stoi(message.substr(strlen("DIRECT_PORT:")));
+            pthread_mutex_lock(&queue_mutex);
+            users[current_user].direct_port = port;
+            pthread_mutex_unlock(&queue_mutex);
+            continue;
+        }
 
         if (!is_logged_in) {
-            // Not logged in states:
             if (message == "1") {
-                // Register
                 string response = "SERVER: Please enter your username and password separated by a space (e.g., user pass): ";
                 send(client_socket, response.c_str(), response.size(), 0);
 
-                memset(buffer, 0, sizeof(buffer));
+                memset(buffer,0,sizeof(buffer));
                 bytes_read = read(client_socket, buffer, 1024);
-                if (bytes_read <= 0) break;
+                if (bytes_read <=0) break;
 
                 string credentials(buffer);
+                credentials = credentials.substr(0,credentials.find("\n"));
+                rtrim(credentials);
                 string username = credentials.substr(0, credentials.find(' '));
-                string password = credentials.substr(credentials.find(' ') + 1);
+                string password = credentials.substr(credentials.find(' ')+1);
 
                 pthread_mutex_lock(&queue_mutex);
-                if (users.find(username) != users.end()) {
+                if (users.find(username)!=users.end() && users[username].password!="") {
                     response = "SERVER: Username already exists.\n";
                 } else {
-                    users[username] = password;
+                    users[username].password = password;
+                    users[username].logged_in = false;
                     response = "SERVER: Registration successful.\n";
-                    // LOG in desired format
                     cout << "Register Success : " << username << " " << password << endl;
                 }
                 pthread_mutex_unlock(&queue_mutex);
 
-                send(client_socket, response.c_str(), response.size(), 0);
+                send(client_socket, response.c_str(), response.size(),0);
 
             } else if (message == "2") {
-                // Login
-                string response = "SERVER: Please enter your username and password separated by a space (e.g., user pass): ";
-                send(client_socket, response.c_str(), response.size(), 0);
+                string response="SERVER: Please enter your username and password separated by a space (e.g., user pass): ";
+                send(client_socket,response.c_str(),response.size(),0);
 
-                memset(buffer, 0, sizeof(buffer));
-                bytes_read = read(client_socket, buffer, 1024);
-                if (bytes_read <= 0) break;
+                memset(buffer,0,sizeof(buffer));
+                bytes_read=read(client_socket,buffer,1024);
+                if (bytes_read<=0) break;
 
                 string credentials(buffer);
+                credentials = credentials.substr(0,credentials.find("\n"));
+                rtrim(credentials);
                 string username = credentials.substr(0, credentials.find(' '));
-                string password = credentials.substr(credentials.find(' ') + 1);
+                string password = credentials.substr(credentials.find(' ')+1);
 
                 pthread_mutex_lock(&queue_mutex);
-                if (users.find(username) == users.end() || users[username] != password) {
-                    response = "SERVER: Login failed: incorrect username or password.\n";
-                } else if (logged_in_clients.find(username) != logged_in_clients.end()) {
-                    response = "SERVER: Login failed: user already logged in.\n";
+                if (users.find(username)==users.end()||users[username].password!=password) {
+                    response="SERVER: Login failed: incorrect username or password.\n";
+                } else if (users[username].logged_in) {
+                    response="SERVER: Login failed: user already logged in.\n";
                 } else {
-                    is_logged_in = true;
-                    current_user = username;
-                    logged_in_clients[username] = client_socket;
-                    response = "SERVER: Login successful.\n";
-                    // LOG in desired format
+                    is_logged_in=true;
+                    current_user=username;
+                    users[username].logged_in=true;
+                    users[username].sock=client_socket;
+                    users[username].ip=string(client_ip);
+                    logged_in_clients[username]=client_socket;
+                    response="SERVER: Login successful.\n";
                     cout << "Login Success : " << username << endl;
                 }
                 pthread_mutex_unlock(&queue_mutex);
 
-                send(client_socket, response.c_str(), response.size(), 0);
+                send(client_socket,response.c_str(),response.size(),0);
 
-            } else if (message == "3") {
-                // Exit
-                string response = "SERVER: Exiting...\n";
-                send(client_socket, response.c_str(), response.size(), 0);
+            } else if (message=="3") {
+                string response="SERVER: Exiting...\n";
+                send(client_socket,response.c_str(),response.size(),0);
                 break;
 
             } else {
-                // Invalid Option
-                string response = "SERVER: Invalid option.\n";
-                send(client_socket, response.c_str(), response.size(), 0);
+                string response="SERVER: Invalid option.\n";
+                send(client_socket,response.c_str(),response.size(),0);
             }
 
         } else {
-            // Logged in states:
-            if (message == "1") {
-                // Logout
+            // Logged in: 1=Logout,2=Relay,3=Direct,4=Exit
+            if (message=="1") {
                 pthread_mutex_lock(&queue_mutex);
+                users[current_user].logged_in=false;
                 logged_in_clients.erase(current_user);
                 pthread_mutex_unlock(&queue_mutex);
-
-                is_logged_in = false;
                 current_user.clear();
+                is_logged_in=false;
+                string response="SERVER: Logged out successfully.\n";
+                send(client_socket,response.c_str(),response.size(),0);
 
-                string response = "SERVER: Logged out successfully.\n";
-                send(client_socket, response.c_str(), response.size(), 0);
-
-            } else if (message == "2") {
-                // Send Message
+            } else if (message=="2") {
+                // Relay mode
                 pthread_mutex_lock(&queue_mutex);
-                string response = "SERVER: Online users:\n";
-                for (const auto &pair : logged_in_clients) {
-                    if (pair.first != current_user) {
-                        response += pair.first + "\n";
+                string response="SERVER: Online users:\n";
+                for (auto &u: logged_in_clients) {
+                    if (u.first!=current_user) {
+                        response+=u.first+"\n";
                     }
                 }
                 pthread_mutex_unlock(&queue_mutex);
 
-                if (response == "SERVER: Online users:\n") {
-                    response = "SERVER: No other users are online.\n";
-                    send(client_socket, response.c_str(), response.size(), 0);
+                if (response=="SERVER: Online users:\n") {
+                    response="SERVER: No other users are online.\n";
+                    send(client_socket,response.c_str(),response.size(),0);
                     continue;
                 }
 
-                send(client_socket, response.c_str(), response.size(), 0);
+                send(client_socket,response.c_str(),response.size(),0);
 
-                memset(buffer, 0, sizeof(buffer));
-                bytes_read = read(client_socket, buffer, 1024);
-                if (bytes_read <= 0) break;
+                memset(buffer,0,sizeof(buffer));
+                bytes_read=read(client_socket,buffer,1024);
+                if (bytes_read<=0) break;
 
-                string target_user(buffer);
-                target_user = target_user.substr(0, target_user.find("\n"));
-
-                pthread_mutex_lock(&queue_mutex);
-                if (logged_in_clients.find(target_user) == logged_in_clients.end()) {
-                    string errMsg = "SERVER: User not found or not online.\n";
+                {
+                    string target_user(buffer);
+                    target_user=target_user.substr(0,target_user.find("\n"));
+                    rtrim(target_user);
+                    pthread_mutex_lock(&queue_mutex);
+                    if (users.find(target_user)==users.end() || !users[target_user].logged_in) {
+                        pthread_mutex_unlock(&queue_mutex);
+                        string err="SERVER: User not found or not online.\n";
+                        send(client_socket,err.c_str(),err.size(),0);
+                        continue;
+                    }
+                    int target_sock = users[target_user].sock;
                     pthread_mutex_unlock(&queue_mutex);
-                    send(client_socket, errMsg.c_str(), errMsg.size(), 0);
+
+                    string prompt="SERVER: Enter your message: ";
+                    send(client_socket,prompt.c_str(),prompt.size(),0);
+
+                    memset(buffer,0,sizeof(buffer));
+                    bytes_read=read(client_socket,buffer,1024);
+                    if (bytes_read<=0) break;
+                    string user_msg(buffer);
+                    user_msg=user_msg.substr(0,user_msg.find("\n"));
+                    rtrim(user_msg);
+                    string final_msg="MSG: "+current_user+": "+user_msg;
+                    cout << current_user << " send message to " << target_user << " : " << user_msg << endl;
+
+                    send(target_sock,final_msg.c_str(),final_msg.size(),0);
+                }
+
+            } else if (message=="3") {
+                // Direct mode
+                pthread_mutex_lock(&queue_mutex);
+                string response="SERVER: Online users (direct):\n";
+                for (auto &u:users) {
+                    if (u.first!=current_user && u.second.logged_in && u.second.direct_port!=-1) {
+                        response+=u.first+"\n";
+                    }
+                }
+                pthread_mutex_unlock(&queue_mutex);
+
+                if (response=="SERVER: Online users (direct):\n") {
+                    response="SERVER: No other users are online.\n";
+                    send(client_socket,response.c_str(),response.size(),0);
                     continue;
                 }
-                int target_socket = logged_in_clients[target_user];
-                pthread_mutex_unlock(&queue_mutex);
 
-                string prompt = "SERVER: Enter your message: ";
-                send(client_socket, prompt.c_str(), prompt.size(), 0);
+                send(client_socket,response.c_str(),response.size(),0);
 
-                memset(buffer, 0, sizeof(buffer));
-                bytes_read = read(client_socket, buffer, 1024);
-                if (bytes_read <= 0) break;
+                memset(buffer,0,sizeof(buffer));
+                bytes_read=read(client_socket,buffer,1024);
+                if (bytes_read<=0) break;
+                {
+                    string target_user(buffer);
+                    target_user=target_user.substr(0,target_user.find("\n"));
+                    rtrim(target_user);
+                    pthread_mutex_lock(&queue_mutex);
+                    if (users.find(target_user)==users.end()||!users[target_user].logged_in||users[target_user].direct_port==-1) {
+                        pthread_mutex_unlock(&queue_mutex);
+                        string err="SERVER: User not found or not online.\n";
+                        send(client_socket,err.c_str(),err.size(),0);
+                        continue;
+                    }
+                    string ip=users[target_user].ip;
+                    int dport=users[target_user].direct_port;
+                    pthread_mutex_unlock(&queue_mutex);
 
-                string user_msg(buffer);
-                string final_msg = "MSG: " + current_user + ": " + user_msg;
+                    cout << "[DEBUG] Direct mode: " << current_user << " -> " << target_user << " IP=" << ip << " PORT=" << dport << endl;
 
-                // LOG in desired format
-                cout << current_user << " send message to " << target_user 
-                     << " : " << user_msg << endl;
+                    string info="SERVER:TARGET_INFO: "+ip+" "+to_string(dport)+"\n";
+                    send(client_socket,info.c_str(),info.size(),0);
+                }
 
-                // Relay
-                send(target_socket, final_msg.c_str(), final_msg.size(), 0);
-
-            } else if (message == "3") {
-                // Exit (logged in)
-                string response = "SERVER: Exiting...\n";
-                send(client_socket, response.c_str(), response.size(), 0);
-
-                pthread_mutex_lock(&queue_mutex);
-                logged_in_clients.erase(current_user);
-                pthread_mutex_unlock(&queue_mutex);
-
+            } else if (message=="4") {
+                string response="SERVER: Exiting...\n";
+                send(client_socket,response.c_str(),response.size(),0);
+                if (is_logged_in) {
+                    pthread_mutex_lock(&queue_mutex);
+                    users[current_user].logged_in=false;
+                    logged_in_clients.erase(current_user);
+                    pthread_mutex_unlock(&queue_mutex);
+                }
                 break;
-
             } else {
-                // Invalid Option
-                string response = "SERVER: Invalid option.\n";
-                send(client_socket, response.c_str(), response.size(), 0);
+                string response="SERVER: Invalid option.\n";
+                send(client_socket,response.c_str(),response.size(),0);
             }
         }
     }
@@ -207,13 +272,12 @@ void handle_client(int client_socket) {
     close(client_socket);
 }
 
-// Worker threads
 void *worker_thread(void *arg) {
     while (true) {
         pthread_mutex_lock(&queue_mutex);
 
         while (client_queue.empty()) {
-            pthread_cond_wait(&condition_var, &queue_mutex);
+            pthread_cond_wait(&condition_var,&queue_mutex);
         }
 
         int client_socket = client_queue.front();
@@ -229,45 +293,44 @@ void *worker_thread(void *arg) {
 int main() {
     int server_fd, client_socket;
     struct sockaddr_in address;
-    int opt = 1;
-    int addrlen = sizeof(address);
+    int opt=1;
+    int addrlen=sizeof(address);
 
-    if ((server_fd = socket(AF_INET, SOCK_STREAM, 0)) == 0) {
+    if ((server_fd=socket(AF_INET, SOCK_STREAM,0))==0) {
         perror("Socket failed");
         exit(EXIT_FAILURE);
     }
 
-    if (setsockopt(server_fd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt))) {
+    if (setsockopt(server_fd,SOL_SOCKET,SO_REUSEADDR,&opt,sizeof(opt))) {
         perror("setsockopt failed");
         close(server_fd);
         exit(EXIT_FAILURE);
     }
 
-    address.sin_family = AF_INET;
-    address.sin_addr.s_addr = INADDR_ANY;
-    address.sin_port = htons(PORT);
+    address.sin_family=AF_INET;
+    address.sin_addr.s_addr=INADDR_ANY;
+    address.sin_port=htons(PORT);
 
-    if (::bind(server_fd, (struct sockaddr *)&address, sizeof(address)) < 0) {
+    if (::bind(server_fd,(struct sockaddr*)&address,sizeof(address))<0) {
         perror("Bind failed");
         close(server_fd);
         exit(EXIT_FAILURE);
     }
 
-    if (listen(server_fd, MAX_QUEUE_SIZE) < 0) {
+    if (listen(server_fd,MAX_QUEUE_SIZE)<0) {
         perror("Listen failed");
         close(server_fd);
         exit(EXIT_FAILURE);
     }
-    cout << "Server started on port " << PORT << "...\n";
+    cout<<"Server started on port "<<PORT<<"...\n";
 
     pthread_t thread_pool[MAX_WORKERS];
-    for (int i = 0; i < MAX_WORKERS; ++i) {
-        pthread_create(&thread_pool[i], nullptr, worker_thread, nullptr);
+    for (int i=0;i<MAX_WORKERS;++i) {
+        pthread_create(&thread_pool[i],nullptr,worker_thread,nullptr);
     }
 
-    // Main thread accepts incoming connections
     while (true) {
-        if ((client_socket = accept(server_fd, (struct sockaddr *)&address, (socklen_t *)&addrlen)) < 0) {
+        if ((client_socket=accept(server_fd,(struct sockaddr*)&address,(socklen_t*)&addrlen))<0) {
             perror("Accept failed");
             continue;
         }
