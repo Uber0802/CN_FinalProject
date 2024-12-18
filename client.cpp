@@ -1,4 +1,3 @@
-// client.cpp
 #include <iostream>
 #include <string>
 #include <cstring>
@@ -9,6 +8,8 @@
 #include <mutex>
 #include <condition_variable>
 #include <cctype>
+#include <openssl/ssl.h>
+#include <openssl/err.h>
 
 #define PORT 8080
 
@@ -22,6 +23,10 @@ condition_variable cv;
 
 int direct_listen_port = 0; 
 int direct_listen_sock;
+
+SSL_CTX *client_ctx;        // For outgoing client connections (main server, direct initiate)
+SSL_CTX *direct_server_ctx; // For incoming direct connections (acts as "server" for direct mode)
+SSL *server_ssl;            // For connection to main server
 
 static inline void rtrim(string &s) {
     while (!s.empty() && isspace((unsigned char)s.back())) {
@@ -37,7 +42,64 @@ void signal_interaction_finished() {
     cv.notify_one();
 }
 
-// Thread to listen for direct messages (with ephemeral port)
+void init_openssl_library() {
+    SSL_load_error_strings();
+    OpenSSL_add_ssl_algorithms();
+}
+
+void cleanup_openssl() {
+    EVP_cleanup();
+}
+
+SSL_CTX* create_client_context() {
+    const SSL_METHOD *method = TLS_client_method();
+    SSL_CTX *ctx = SSL_CTX_new(method);
+    if(!ctx) {
+        perror("Unable to create SSL client context");
+        ERR_print_errors_fp(stderr);
+        exit(EXIT_FAILURE);
+    }
+    return ctx;
+}
+
+SSL_CTX* create_direct_server_context() {
+    const SSL_METHOD *method = TLS_server_method();
+    SSL_CTX *ctx = SSL_CTX_new(method);
+    if (!ctx) {
+        perror("Unable to create SSL server context (for direct mode)");
+        ERR_print_errors_fp(stderr);
+        exit(EXIT_FAILURE);
+    }
+    return ctx;
+}
+
+void configure_client_context(SSL_CTX *ctx, const char* ca_cert_file) {
+    if (!SSL_CTX_load_verify_locations(ctx, ca_cert_file, NULL)) {
+        ERR_print_errors_fp(stderr);
+        exit(EXIT_FAILURE);
+    }
+    SSL_CTX_set_verify(ctx, SSL_VERIFY_PEER, NULL);
+    SSL_CTX_set_verify_depth(ctx, 4);
+}
+
+void configure_direct_server_context(SSL_CTX *ctx, const char* cert_file, const char* key_file) {
+    // Load certificate and key for the direct listener
+    if (SSL_CTX_use_certificate_file(ctx, cert_file, SSL_FILETYPE_PEM) <= 0) {
+        ERR_print_errors_fp(stderr);
+        exit(EXIT_FAILURE);
+    }
+    if (SSL_CTX_use_PrivateKey_file(ctx, key_file, SSL_FILETYPE_PEM) <= 0 ) {
+        ERR_print_errors_fp(stderr);
+        exit(EXIT_FAILURE);
+    }
+
+    if (!SSL_CTX_check_private_key(ctx)) {
+        fprintf(stderr, "Direct server private key does not match the certificate\n");
+        exit(EXIT_FAILURE);
+    }
+}
+
+// Thread to listen for direct messages
 void direct_listener() {
     direct_listen_sock = socket(AF_INET, SOCK_STREAM, 0);
     if (direct_listen_sock < 0) {
@@ -51,8 +113,7 @@ void direct_listener() {
     struct sockaddr_in addr;
     addr.sin_family = AF_INET;
     addr.sin_addr.s_addr = INADDR_ANY;
-    // Port 0: Let OS assign an available port
-    addr.sin_port = htons(0);
+    addr.sin_port = htons(0); // ephemeral port
 
     if (::bind(direct_listen_sock, (struct sockaddr*)&addr, sizeof(addr)) < 0) {
         cerr << "Bind failed for direct listener\n";
@@ -65,8 +126,7 @@ void direct_listener() {
         return;
     }
 
-    int assigned_port = ntohs(addr.sin_port);
-    direct_listen_port = assigned_port;
+    direct_listen_port = ntohs(addr.sin_port);
     cerr << "Assigned direct port: " << direct_listen_port << endl;
 
     if (listen(direct_listen_sock, 5) < 0) {
@@ -83,30 +143,61 @@ void direct_listener() {
             continue;
         }
 
-        char buffer[1024] = {0};
-        int bytes = read(new_sock, buffer, 1024);
-        if (bytes > 0) {
-            cout << "\n[Direct Message Received]: " << buffer << endl;
+        // Wrap new_sock in SSL for direct connection (server side)
+        SSL *direct_ssl = SSL_new(direct_server_ctx);
+        SSL_set_fd(direct_ssl, new_sock);
+        if (SSL_accept(direct_ssl) <= 0) {
+            ERR_print_errors_fp(stderr);
+            close(new_sock);
+            SSL_free(direct_ssl);
+            continue;
         }
+
+        // Continuously read messages until the other client closes the connection
+        char buffer[1024];
+        while (true) {
+            memset(buffer, 0, sizeof(buffer));
+            int bytes = SSL_read(direct_ssl, buffer, 1024);
+            if (bytes > 0) {
+                cout << "\n[Direct Message Received]: " << buffer << endl;
+            } else if (bytes == 0) {
+                // Peer closed the connection gracefully
+                break;
+            } else {
+                // An error occurred
+                int err = SSL_get_error(direct_ssl, bytes);
+                if (err == SSL_ERROR_ZERO_RETURN) {
+                    // Connection closed
+                    break;
+                } else {
+                    // Other SSL error
+                    ERR_print_errors_fp(stderr);
+                    break;
+                }
+            }
+        }
+
+        // Gracefully shutdown the direct SSL connection
+        // SSL_shutdown(direct_ssl);
+        SSL_free(direct_ssl);
         close(new_sock);
     }
 }
 
-void receive_messages(int sock) {
+void receive_messages() {
     char buffer[1024] = {0};
 
     while (true) {
         memset(buffer, 0, sizeof(buffer));
-        int bytes_read = read(sock, buffer, 1024);
+        int bytes_read = SSL_read(server_ssl, buffer, 1024);
         if (bytes_read <= 0) {
-            close(sock);
+            // Just break, do not free server_ssl here
             break;
         }
 
         string message(buffer);
 
         if (message.rfind("MSG:", 0) == 0) {
-            // Relay message
             if (!interacting_with_server) {
                 cout << "\n[Message Received]: " << message.substr(4) << endl;
             }
@@ -127,9 +218,9 @@ void receive_messages(int sock) {
                     lock_guard<mutex> lock(mtx);
                     interacting_with_server = true;
                 }
-                // After login, send our assigned direct port to the server
+                // Send DIRECT_PORT after login
                 string port_msg = "DIRECT_PORT:" + to_string(direct_listen_port);
-                send(sock, port_msg.c_str(), port_msg.size(), 0);
+                SSL_write(server_ssl, port_msg.c_str(), port_msg.size());
                 signal_interaction_finished();
             }
             else if (server_message.find("Login failed:") != string::npos) {
@@ -143,14 +234,13 @@ void receive_messages(int sock) {
                     lock_guard<mutex> lock(mtx);
                     interacting_with_server = true;
                 }
-                string credentials;
                 cout << "Enter <username> <password>: ";
+                string credentials;
                 getline(cin, credentials);
-                send(sock, credentials.c_str(), credentials.size(), 0);
+                SSL_write(server_ssl, credentials.c_str(), credentials.size());
             }
             else if (server_message.find("Online users:") != string::npos && 
                      server_message.find("direct") == string::npos) {
-                // Relay mode sending
                 {
                     lock_guard<mutex> lock(mtx);
                     interacting_with_server = true;
@@ -159,10 +249,10 @@ void receive_messages(int sock) {
                 string target_user;
                 getline(cin, target_user);
                 rtrim(target_user);
-                send(sock, target_user.c_str(), target_user.size(), 0);
+                SSL_write(server_ssl, target_user.c_str(), target_user.size());
 
                 memset(buffer, 0, sizeof(buffer));
-                int read_count = read(sock, buffer, 1024);
+                int read_count = SSL_read(server_ssl, buffer, 1024);
                 if (read_count > 0) {
                     string next_msg(buffer);
                     cout << next_msg << endl;
@@ -170,9 +260,10 @@ void receive_messages(int sock) {
                         signal_interaction_finished();
                         continue;
                     } else if (next_msg.find("Enter your message:") != string::npos) {
+                        cout << "Enter your message: ";
                         string msg;
                         getline(cin, msg);
-                        send(sock, msg.c_str(), msg.size(), 0);
+                        SSL_write(server_ssl, msg.c_str(), msg.size());
                         signal_interaction_finished();
                     } else {
                         signal_interaction_finished();
@@ -182,7 +273,6 @@ void receive_messages(int sock) {
                 }
             }
             else if (server_message.find("Online users (direct):") != string::npos) {
-                // Direct mode sending
                 {
                     lock_guard<mutex> lock(mtx);
                     interacting_with_server = true;
@@ -191,10 +281,10 @@ void receive_messages(int sock) {
                 string target_user;
                 getline(cin, target_user);
                 rtrim(target_user);
-                send(sock, target_user.c_str(), target_user.size(), 0);
+                SSL_write(server_ssl, target_user.c_str(), target_user.size());
 
                 memset(buffer, 0, sizeof(buffer));
-                int read_count = read(sock, buffer, 1024);
+                int read_count = SSL_read(server_ssl, buffer, 1024);
                 if (read_count > 0) {
                     string info_msg(buffer);
                     cout << info_msg << endl;
@@ -213,6 +303,7 @@ void receive_messages(int sock) {
                         string direct_msg;
                         getline(cin, direct_msg);
 
+                        // Connect directly with SSL as a client
                         int direct_sock = socket(AF_INET, SOCK_STREAM,0);
                         struct sockaddr_in target_addr;
                         memset(&target_addr,0,sizeof(target_addr));
@@ -222,11 +313,28 @@ void receive_messages(int sock) {
 
                         if (connect(direct_sock, (struct sockaddr*)&target_addr, sizeof(target_addr)) < 0) {
                             cout << "Failed to connect to target user directly.\n";
-                        } else {
-                            send(direct_sock, direct_msg.c_str(), direct_msg.size(), 0);
                             close(direct_sock);
-                            cout << "Direct message sent.\n";
+                            signal_interaction_finished();
+                            continue;
                         }
+
+                        SSL *direct_ssl = SSL_new(client_ctx);
+                        SSL_set_fd(direct_ssl, direct_sock);
+                        if (SSL_connect(direct_ssl)<=0) {
+                            ERR_print_errors_fp(stderr);
+                            close(direct_sock);
+                            SSL_free(direct_ssl);
+                            cout<<"SSL connect failed to direct user.\n";
+                            signal_interaction_finished();
+                            continue;
+                        }
+
+                        SSL_write(direct_ssl, direct_msg.c_str(), direct_msg.size());
+                        cout << "Direct message sent.\n";
+
+                        SSL_shutdown(direct_ssl);
+                        SSL_free(direct_ssl);
+                        close(direct_sock);
                         signal_interaction_finished();
                     } else {
                         signal_interaction_finished();
@@ -248,8 +356,20 @@ void receive_messages(int sock) {
     }
 }
 
-int main() {
-    // Start direct listener thread (assigns ephemeral port)
+int main(int argc, char **argv) {
+    if (argc < 4) {
+        cerr << "Usage: " << argv[0] << " <ca.crt> <client_server.crt> <client_server.key>\n";
+        return -1;
+    }
+
+    init_openssl_library();
+    client_ctx = create_client_context();
+    configure_client_context(client_ctx, argv[1]);
+
+    direct_server_ctx = create_direct_server_context();
+    configure_direct_server_context(direct_server_ctx, argv[2], argv[3]);
+
+    // Start direct listener thread
     thread dl(direct_listener);
     dl.detach();
 
@@ -274,13 +394,25 @@ int main() {
         return -1;
     }
 
-    thread listener(receive_messages, sock);
+    server_ssl = SSL_new(client_ctx);
+    SSL_set_fd(server_ssl, sock);
+    if (SSL_connect(server_ssl) <= 0) {
+        ERR_print_errors_fp(stderr);
+        close(sock);
+        SSL_free(server_ssl);
+        return -1;
+    }
+
+    // Start thread to handle receiving messages
+    thread listener(receive_messages);
     listener.detach();
 
     while (true) {
         {
             unique_lock<mutex> lock(mtx);
-            cv.wait(lock, [] { return !interacting_with_server; });
+            while (interacting_with_server) {
+                cv.wait(lock);
+            }
         }
 
         cout << "\nSelect a service:\n";
@@ -298,7 +430,7 @@ int main() {
         string choice;
         getline(cin, choice);
         rtrim(choice);
-        send(sock, choice.c_str(), choice.size(), 0);
+        SSL_write(server_ssl, choice.c_str(), choice.size());
 
         if ((!logged_in && choice == "3") || (logged_in && choice == "4")) {
             cout << "Exiting...\n";
@@ -318,6 +450,11 @@ int main() {
         }
     }
 
-    close(sock);
+    // Properly shut down and free resources once main loop ends
+    SSL_shutdown(server_ssl);
+    SSL_free(server_ssl);
+    SSL_CTX_free(client_ctx);
+    SSL_CTX_free(direct_server_ctx);
+    cleanup_openssl();
     return 0;
 }

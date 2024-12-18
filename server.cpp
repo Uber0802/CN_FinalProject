@@ -1,4 +1,3 @@
-// server.cpp
 #include <iostream>
 #include <string>
 #include <unordered_map>
@@ -9,6 +8,8 @@
 #include <arpa/inet.h>
 #include <unistd.h>
 #include <cctype>
+#include <openssl/ssl.h>
+#include <openssl/err.h>
 
 #define PORT 8080
 #define MAX_WORKERS 10
@@ -30,35 +31,83 @@ queue<int> client_queue;
 pthread_mutex_t queue_mutex = PTHREAD_MUTEX_INITIALIZER;
 pthread_cond_t condition_var = PTHREAD_COND_INITIALIZER;
 
+// SSL Globals (server)
+SSL_CTX *server_ctx;
+
+// Global map for user->SSL*
+unordered_map<string, SSL*> user_ssl_map;
+
 static inline void rtrim(string &s) {
     while (!s.empty() && isspace((unsigned char)s.back())) {
         s.pop_back();
     }
 }
 
-void handle_client(int client_socket) {
+void init_openssl_library() {
+    SSL_load_error_strings();
+    OpenSSL_add_ssl_algorithms();
+}
+
+void cleanup_openssl() {
+    EVP_cleanup();
+}
+
+SSL_CTX* create_server_context() {
+    const SSL_METHOD *method = TLS_server_method();
+    SSL_CTX *ctx = SSL_CTX_new(method);
+    if (!ctx) {
+        ERR_print_errors_fp(stderr);
+        exit(EXIT_FAILURE);
+    }
+    return ctx;
+}
+
+void configure_server_context(SSL_CTX *ctx, const char* cert_file, const char* key_file) {
+    // Load server certificate
+    if (SSL_CTX_use_certificate_file(ctx, cert_file, SSL_FILETYPE_PEM) <= 0) {
+        ERR_print_errors_fp(stderr);
+        exit(EXIT_FAILURE);
+    }
+    // Load server private key
+    if (SSL_CTX_use_PrivateKey_file(ctx, key_file, SSL_FILETYPE_PEM) <= 0 ) {
+        ERR_print_errors_fp(stderr);
+        exit(EXIT_FAILURE);
+    }
+
+    // Verify private key
+    if (!SSL_CTX_check_private_key(ctx)) {
+        fprintf(stderr, "Private key does not match the public certificate\n");
+        exit(EXIT_FAILURE);
+    }
+}
+
+void handle_client_ssl(SSL *ssl) {
     char buffer[1024] = {0};
     bool is_logged_in = false;
     string current_user;
 
     struct sockaddr_in addr;
     socklen_t addr_len = sizeof(addr);
+    int client_socket = SSL_get_fd(ssl);
     getpeername(client_socket, (struct sockaddr*)&addr, &addr_len);
     char client_ip[INET_ADDRSTRLEN];
     inet_ntop(AF_INET, &addr.sin_addr, client_ip, INET_ADDRSTRLEN);
 
     while (true) {
-        memset(buffer, 0, sizeof(buffer));
-        int bytes_read = read(client_socket, buffer, 1024);
-
+        memset(buffer,0,sizeof(buffer));
+        int bytes_read = SSL_read(ssl, buffer, 1024);
         if (bytes_read <= 0) {
+            // Connection closed
             if (is_logged_in) {
                 pthread_mutex_lock(&queue_mutex);
                 users[current_user].logged_in = false;
                 logged_in_clients.erase(current_user);
+                // Remove from user_ssl_map
+                user_ssl_map.erase(current_user);
                 pthread_mutex_unlock(&queue_mutex);
             }
             close(client_socket);
+            SSL_free(ssl);
             break;
         }
 
@@ -67,6 +116,7 @@ void handle_client(int client_socket) {
         rtrim(message);
 
         if (is_logged_in && message.rfind("DIRECT_PORT:", 0) == 0) {
+            // Set the direct port
             int port = stoi(message.substr(strlen("DIRECT_PORT:")));
             pthread_mutex_lock(&queue_mutex);
             users[current_user].direct_port = port;
@@ -75,13 +125,14 @@ void handle_client(int client_socket) {
         }
 
         if (!is_logged_in) {
-            if (message == "1") {
+            // Not logged in states
+            if (message == "1") { // Register
                 string response = "SERVER: Please enter your username and password separated by a space (e.g., user pass): ";
-                send(client_socket, response.c_str(), response.size(), 0);
+                SSL_write(ssl, response.c_str(), response.size());
 
                 memset(buffer,0,sizeof(buffer));
-                bytes_read = read(client_socket, buffer, 1024);
-                if (bytes_read <=0) break;
+                bytes_read = SSL_read(ssl, buffer, 1024);
+                if (bytes_read<=0) break;
 
                 string credentials(buffer);
                 credentials = credentials.substr(0,credentials.find("\n"));
@@ -100,14 +151,14 @@ void handle_client(int client_socket) {
                 }
                 pthread_mutex_unlock(&queue_mutex);
 
-                send(client_socket, response.c_str(), response.size(),0);
+                SSL_write(ssl, response.c_str(), response.size());
 
-            } else if (message == "2") {
+            } else if (message == "2") { // Login
                 string response="SERVER: Please enter your username and password separated by a space (e.g., user pass): ";
-                send(client_socket,response.c_str(),response.size(),0);
+                SSL_write(ssl,response.c_str(),response.size());
 
                 memset(buffer,0,sizeof(buffer));
-                bytes_read=read(client_socket,buffer,1024);
+                bytes_read=SSL_read(ssl,buffer,1024);
                 if (bytes_read<=0) break;
 
                 string credentials(buffer);
@@ -128,37 +179,40 @@ void handle_client(int client_socket) {
                     users[username].sock=client_socket;
                     users[username].ip=string(client_ip);
                     logged_in_clients[username]=client_socket;
+                    // Store SSL pointer for this user
+                    user_ssl_map[username] = ssl;
                     response="SERVER: Login successful.\n";
                     cout << "Login Success : " << username << endl;
                 }
                 pthread_mutex_unlock(&queue_mutex);
 
-                send(client_socket,response.c_str(),response.size(),0);
+                SSL_write(ssl,response.c_str(),response.size());
 
-            } else if (message=="3") {
+            } else if (message=="3") { // Exit
                 string response="SERVER: Exiting...\n";
-                send(client_socket,response.c_str(),response.size(),0);
+                SSL_write(ssl,response.c_str(),response.size());
                 break;
 
             } else {
                 string response="SERVER: Invalid option.\n";
-                send(client_socket,response.c_str(),response.size(),0);
+                SSL_write(ssl,response.c_str(),response.size());
             }
 
         } else {
-            // Logged in: 1=Logout,2=Relay,3=Direct,4=Exit
-            if (message=="1") {
+            // Logged in
+            if (message=="1") { // Logout
                 pthread_mutex_lock(&queue_mutex);
                 users[current_user].logged_in=false;
                 logged_in_clients.erase(current_user);
+                user_ssl_map.erase(current_user);
                 pthread_mutex_unlock(&queue_mutex);
+
                 current_user.clear();
                 is_logged_in=false;
                 string response="SERVER: Logged out successfully.\n";
-                send(client_socket,response.c_str(),response.size(),0);
+                SSL_write(ssl,response.c_str(),response.size());
 
-            } else if (message=="2") {
-                // Relay mode
+            } else if (message=="2") { // Relay mode
                 pthread_mutex_lock(&queue_mutex);
                 string response="SERVER: Online users:\n";
                 for (auto &u: logged_in_clients) {
@@ -170,47 +224,56 @@ void handle_client(int client_socket) {
 
                 if (response=="SERVER: Online users:\n") {
                     response="SERVER: No other users are online.\n";
-                    send(client_socket,response.c_str(),response.size(),0);
+                    SSL_write(ssl,response.c_str(),response.size());
                     continue;
                 }
 
-                send(client_socket,response.c_str(),response.size(),0);
+                SSL_write(ssl,response.c_str(),response.size());
 
                 memset(buffer,0,sizeof(buffer));
-                bytes_read=read(client_socket,buffer,1024);
+                bytes_read=SSL_read(ssl,buffer,1024);
                 if (bytes_read<=0) break;
 
                 {
                     string target_user(buffer);
                     target_user=target_user.substr(0,target_user.find("\n"));
                     rtrim(target_user);
+
                     pthread_mutex_lock(&queue_mutex);
                     if (users.find(target_user)==users.end() || !users[target_user].logged_in) {
                         pthread_mutex_unlock(&queue_mutex);
                         string err="SERVER: User not found or not online.\n";
-                        send(client_socket,err.c_str(),err.size(),0);
+                        SSL_write(ssl,err.c_str(),err.size());
                         continue;
                     }
-                    int target_sock = users[target_user].sock;
                     pthread_mutex_unlock(&queue_mutex);
 
                     string prompt="SERVER: Enter your message: ";
-                    send(client_socket,prompt.c_str(),prompt.size(),0);
+                    SSL_write(ssl,prompt.c_str(),prompt.size());
 
                     memset(buffer,0,sizeof(buffer));
-                    bytes_read=read(client_socket,buffer,1024);
+                    bytes_read=SSL_read(ssl,buffer,1024);
                     if (bytes_read<=0) break;
+
                     string user_msg(buffer);
                     user_msg=user_msg.substr(0,user_msg.find("\n"));
                     rtrim(user_msg);
                     string final_msg="MSG: "+current_user+": "+user_msg;
                     cout << current_user << " send message to " << target_user << " : " << user_msg << endl;
 
-                    send(target_sock,final_msg.c_str(),final_msg.size(),0);
+                    // Send message to target user's SSL session
+                    pthread_mutex_lock(&queue_mutex);
+                    if (user_ssl_map.find(target_user)!=user_ssl_map.end()) {
+                        SSL *target_ssl = user_ssl_map[target_user];
+                        SSL_write(target_ssl, final_msg.c_str(), final_msg.size());
+                    } else {
+                        string err = "SERVER: Couldn't find target user's SSL session.\n";
+                        SSL_write(ssl, err.c_str(), err.size());
+                    }
+                    pthread_mutex_unlock(&queue_mutex);
                 }
 
-            } else if (message=="3") {
-                // Direct mode
+            } else if (message=="3") { // Direct mode
                 pthread_mutex_lock(&queue_mutex);
                 string response="SERVER: Online users (direct):\n";
                 for (auto &u:users) {
@@ -222,14 +285,14 @@ void handle_client(int client_socket) {
 
                 if (response=="SERVER: Online users (direct):\n") {
                     response="SERVER: No other users are online.\n";
-                    send(client_socket,response.c_str(),response.size(),0);
+                    SSL_write(ssl,response.c_str(),response.size());
                     continue;
                 }
 
-                send(client_socket,response.c_str(),response.size(),0);
+                SSL_write(ssl,response.c_str(),response.size());
 
                 memset(buffer,0,sizeof(buffer));
-                bytes_read=read(client_socket,buffer,1024);
+                bytes_read=SSL_read(ssl,buffer,1024);
                 if (bytes_read<=0) break;
                 {
                     string target_user(buffer);
@@ -239,7 +302,7 @@ void handle_client(int client_socket) {
                     if (users.find(target_user)==users.end()||!users[target_user].logged_in||users[target_user].direct_port==-1) {
                         pthread_mutex_unlock(&queue_mutex);
                         string err="SERVER: User not found or not online.\n";
-                        send(client_socket,err.c_str(),err.size(),0);
+                        SSL_write(ssl,err.c_str(),err.size());
                         continue;
                     }
                     string ip=users[target_user].ip;
@@ -249,22 +312,23 @@ void handle_client(int client_socket) {
                     cout << "[DEBUG] Direct mode: " << current_user << " -> " << target_user << " IP=" << ip << " PORT=" << dport << endl;
 
                     string info="SERVER:TARGET_INFO: "+ip+" "+to_string(dport)+"\n";
-                    send(client_socket,info.c_str(),info.size(),0);
+                    SSL_write(ssl,info.c_str(),info.size());
                 }
 
-            } else if (message=="4") {
+            } else if (message=="4") { // Exit
                 string response="SERVER: Exiting...\n";
-                send(client_socket,response.c_str(),response.size(),0);
+                SSL_write(ssl,response.c_str(),response.size());
                 if (is_logged_in) {
                     pthread_mutex_lock(&queue_mutex);
                     users[current_user].logged_in=false;
                     logged_in_clients.erase(current_user);
+                    user_ssl_map.erase(current_user);
                     pthread_mutex_unlock(&queue_mutex);
                 }
                 break;
             } else {
                 string response="SERVER: Invalid option.\n";
-                send(client_socket,response.c_str(),response.size(),0);
+                SSL_write(ssl,response.c_str(),response.size());
             }
         }
     }
@@ -285,13 +349,34 @@ void *worker_thread(void *arg) {
 
         pthread_mutex_unlock(&queue_mutex);
 
-        handle_client(client_socket);
+        // Wrap socket with SSL
+        SSL *ssl = SSL_new(server_ctx);
+        SSL_set_fd(ssl, client_socket);
+
+        if (SSL_accept(ssl) <= 0) {
+            ERR_print_errors_fp(stderr);
+            close(client_socket);
+            SSL_free(ssl);
+            continue;
+        }
+
+        // Now handle the client with SSL
+        handle_client_ssl(ssl);
     }
     return nullptr;
 }
 
-int main() {
-    int server_fd, client_socket;
+int main(int argc, char **argv) {
+    if (argc < 3) {
+        cerr << "Usage: " << argv[0] << " <server.crt> <server.key>\n";
+        return -1;
+    }
+
+    init_openssl_library();
+    server_ctx = create_server_context();
+    configure_server_context(server_ctx, argv[1], argv[2]);
+
+    int server_fd;
     struct sockaddr_in address;
     int opt=1;
     int addrlen=sizeof(address);
@@ -330,7 +415,8 @@ int main() {
     }
 
     while (true) {
-        if ((client_socket=accept(server_fd,(struct sockaddr*)&address,(socklen_t*)&addrlen))<0) {
+        int client_socket=accept(server_fd,(struct sockaddr*)&address,(socklen_t*)&addrlen);
+        if (client_socket<0) {
             perror("Accept failed");
             continue;
         }
@@ -342,5 +428,7 @@ int main() {
     }
 
     close(server_fd);
+    SSL_CTX_free(server_ctx);
+    cleanup_openssl();
     return 0;
 }
