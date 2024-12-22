@@ -10,6 +10,8 @@
 #include <cctype>
 #include <openssl/ssl.h>
 #include <openssl/err.h>
+#include <sys/stat.h>  // For directory creation
+#include <fcntl.h> 
 
 #define PORT 8080
 
@@ -196,6 +198,111 @@ void receive_messages() {
         }
 
         string message(buffer);
+
+        if (message.rfind("SERVER: Receiving file", 0) == 0) {
+            // Parse file name
+            string file_name = message.substr(message.find("'") + 1);
+            file_name = file_name.substr(0, file_name.find("'"));
+
+            cout << "Receiving file: " << file_name << endl;
+
+            // Create file locally
+            int fd = open(file_name.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0600);
+            if (fd < 0) {
+                cerr << "Error creating file: " << file_name << endl;
+                continue;
+            }
+
+            while (true) {
+                memset(buffer, 0, sizeof(buffer));
+                bytes_read = SSL_read(server_ssl, buffer, sizeof(buffer));
+                if (bytes_read <= 0 || strcmp(buffer, "END_OF_FILE") == 0) {
+                    break; // End of file transmission
+                }
+                write(fd, buffer, bytes_read);
+            }
+
+            close(fd);
+            cout << "File received: " << file_name << endl;
+        }
+
+        if (message.rfind("SERVER: Online users available for file transfer:", 0) == 0) {
+            // Transfer file
+            cout << message << endl;
+
+            // Prompt for recipient username
+            cout << "Enter recipient username: ";
+            string recipient;
+            getline(cin, recipient);
+            rtrim(recipient);
+            SSL_write(server_ssl, recipient.c_str(), recipient.size());
+
+            memset(buffer, 0, sizeof(buffer));
+            bytes_read = SSL_read(server_ssl, buffer, sizeof(buffer));
+            if (bytes_read <= 0) {
+                cerr << "Error: Server did not respond.\n";
+                continue;
+            }
+            string response(buffer);
+            cout << response << endl;
+            if (response.find("not online") != string::npos) continue;
+
+            // Prompt for file name
+            cout << "Enter file name to transfer (e.g., a.txt): ";
+            string file_name;
+            getline(cin, file_name);
+            rtrim(file_name);
+
+            // Automatically locate the file in ./<username>/<filename>
+            string username = "a"; // Replace this with logic to fetch the current username dynamically if available
+            string full_file_path = "./" + username + "/" + file_name;
+
+            // Send file name to the server
+            SSL_write(server_ssl, file_name.c_str(), file_name.size());
+
+            memset(buffer, 0, sizeof(buffer));
+            bytes_read = SSL_read(server_ssl, buffer, sizeof(buffer));
+            if (bytes_read <= 0) {
+                cerr << "Error: Server did not respond.\n";
+                continue;
+            }
+            cout << string(buffer) << endl;
+
+            // Open the file for reading
+            int fd = open(full_file_path.c_str(), O_RDONLY);
+            if (fd < 0) {
+                cerr << "Error: Unable to open file: " << full_file_path << "\n";
+                continue;
+            }
+
+            char file_buffer[1024];
+            ssize_t bytes_read;
+
+            // Start transferring the file
+            cout << "Starting to transfer file: " << file_name << endl;
+
+            while ((bytes_read = read(fd, file_buffer, sizeof(file_buffer))) > 0) {
+                if (SSL_write(server_ssl, file_buffer, bytes_read) <= 0) {
+                    cerr << "Error: Failed to send file data.\n";
+                    break;
+                }
+                cout << "Sent " << bytes_read << " bytes.\n";  // Debugging log
+            }
+            close(fd);
+
+            // Signal the end of the file transfer
+            string end_signal = "END_OF_FILE";
+            SSL_write(server_ssl, end_signal.c_str(), end_signal.size());
+            cout << "File transfer completed for: " << file_name << endl;
+
+            // Receive confirmation from the server
+            memset(buffer, 0, sizeof(buffer));
+            bytes_read = SSL_read(server_ssl, buffer, sizeof(buffer));
+            if (bytes_read > 0) {
+                cout << string(buffer) << endl;
+            }
+        }
+
 
         if (message.rfind("MSG:", 0) == 0) {
             if (!interacting_with_server) {
@@ -424,7 +531,8 @@ int main(int argc, char **argv) {
             cout << "1. Logout\n";
             cout << "2. Send Message (Relay mode)\n";
             cout << "3. Send Message (Direct mode)\n";
-            cout << "4. Exit\n";
+            cout << "4. Transfer file\n";
+            cout << "5. Exit\n";
         }
 
         string choice;
@@ -432,7 +540,7 @@ int main(int argc, char **argv) {
         rtrim(choice);
         SSL_write(server_ssl, choice.c_str(), choice.size());
 
-        if ((!logged_in && choice == "3") || (logged_in && choice == "4")) {
+        if ((!logged_in && choice == "3") || (logged_in && choice == "5")) {
             cout << "Exiting...\n";
             break;
         }
@@ -443,10 +551,11 @@ int main(int argc, char **argv) {
                 interacting_with_server = true;
             }
         } else {
-            if (choice == "1" || choice == "2" || choice == "3") {
+            if (choice == "1" || choice == "2" || choice == "3" || choice == "4") {
                 lock_guard<mutex> lock(mtx);
                 interacting_with_server = true;
             }
+
         }
     }
 

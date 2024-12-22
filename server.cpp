@@ -10,6 +10,10 @@
 #include <cctype>
 #include <openssl/ssl.h>
 #include <openssl/err.h>
+#include <sys/stat.h>  // Include for directory creation
+#include <sys/types.h>
+#include <sys/stat.h>  // For directory creation
+#include <fcntl.h> 
 
 #define PORT 8080
 #define MAX_WORKERS 10
@@ -141,13 +145,21 @@ void handle_client_ssl(SSL *ssl) {
                 string password = credentials.substr(credentials.find(' ')+1);
 
                 pthread_mutex_lock(&queue_mutex);
-                if (users.find(username)!=users.end() && users[username].password!="") {
+                auto create_user_directory = [](const string &username) {
+                    struct stat st;
+                    if (stat(username.c_str(), &st) == -1) {
+                        mkdir(username.c_str(), 0700);
+                    }
+                };
+
+                if (users.find(username) != users.end() && users[username].password != "") {
                     response = "SERVER: Username already exists.\n";
                 } else {
                     users[username].password = password;
                     users[username].logged_in = false;
+                    create_user_directory(username);  // Create a directory for the user
                     response = "SERVER: Registration successful.\n";
-                    cout << "Register Success : " << username << " " << password << endl;
+                    cout << "Register Success: " << username << " " << password << endl;
                 }
                 pthread_mutex_unlock(&queue_mutex);
 
@@ -315,7 +327,119 @@ void handle_client_ssl(SSL *ssl) {
                     SSL_write(ssl,info.c_str(),info.size());
                 }
 
-            } else if (message=="4") { // Exit
+            } else if (message == "4") { // Transfer file
+                pthread_mutex_lock(&queue_mutex);
+
+                // Send the list of online users
+                string response = "SERVER: Online users available for file transfer:\n";
+                for (const auto& user : users) {
+                    if (user.first != current_user && user.second.logged_in) {
+                        response += user.first + "\n";
+                    }
+                }
+                pthread_mutex_unlock(&queue_mutex);
+
+                if (response == "SERVER: Online users available for file transfer:\n") {
+                    response = "SERVER: No other users are online.\n";
+                    SSL_write(ssl, response.c_str(), response.size());
+                    continue;
+                }
+                SSL_write(ssl, response.c_str(), response.size());
+
+                // Receive recipient username
+                memset(buffer, 0, sizeof(buffer));
+                int bytes_read = SSL_read(ssl, buffer, sizeof(buffer));
+                if (bytes_read <= 0) {
+                    cerr << "Error: Failed to read recipient username.\n";
+                    continue;
+                }
+                string recipient(buffer);
+                rtrim(recipient);
+
+                pthread_mutex_lock(&queue_mutex);
+                if (users.find(recipient) == users.end() || !users[recipient].logged_in) {
+                    pthread_mutex_unlock(&queue_mutex);
+                    response = "SERVER: User not found or not online.\n";
+                    SSL_write(ssl, response.c_str(), response.size());
+                    continue;
+                }
+                pthread_mutex_unlock(&queue_mutex);
+
+                // Confirm recipient to the sender
+                response = "SERVER: Selected user: " + recipient + ".\n";
+                SSL_write(ssl, response.c_str(), response.size());
+
+                // Ask for the file name
+                response = "SERVER: Enter the file name to transfer:";
+                SSL_write(ssl, response.c_str(), response.size());
+
+                memset(buffer, 0, sizeof(buffer));
+                bytes_read = SSL_read(ssl, buffer, sizeof(buffer));
+                if (bytes_read <= 0) {
+                    cerr << "Error: Failed to read file name.\n";
+                    continue;
+                }
+                string file_name(buffer);
+                rtrim(file_name);
+
+                // Create recipient's file
+                string file_path = "./" + recipient + "/" + file_name;
+                int fd = open(file_path.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0600);
+                if (fd < 0) {
+                    cerr << "Error creating file for recipient: " << file_path << endl;
+                    response = "SERVER: Error saving file for recipient.\n";
+                    SSL_write(ssl, response.c_str(), response.size());
+                    continue;
+                }
+
+                // Notify sender to start transferring file data
+                response = "SERVER: Ready to receive file data.\n";
+                SSL_write(ssl, response.c_str(), response.size());
+
+                // Receive file data
+                char buffer[1024];
+                while (true) {
+                    cout << "here" << endl;
+                    memset(buffer, 0, sizeof(buffer));
+                    int bytes_read = SSL_read(ssl, buffer, sizeof(buffer));
+                    if (bytes_read <= 0) {
+                        cerr << "Error: SSL_read failed during file transfer.\n";
+                        break;
+                    }
+                    if (strcmp(buffer, "END_OF_FILE") == 0) {
+                        cout << "End of file transfer detected.\n";
+                        break;
+                    }
+                    if (write(fd, buffer, bytes_read) < 0) {
+                        cerr << "Error: Failed to write data to file.\n";
+                        break;
+                    }
+                    cout << "Server: Received " << bytes_read << " bytes.\n";  // Debugging log
+                }
+                close(fd);
+                cout << "File reception completed successfully.\n";
+
+
+
+                // Notify the recipient
+                pthread_mutex_lock(&queue_mutex);
+                SSL* recipient_ssl = user_ssl_map[recipient];
+                pthread_mutex_unlock(&queue_mutex);
+
+                string notify = "SERVER: File '" + file_name + "' has been received and saved in your directory.\n";
+                SSL_write(recipient_ssl, notify.c_str(), notify.size());
+
+
+                // Notify the sender
+                response = "SERVER: File transfer to " + recipient + " completed.\n";
+                SSL_write(ssl, response.c_str(), response.size());
+
+            }
+
+
+
+
+            else if (message=="5") { // Exit
                 string response="SERVER: Exiting...\n";
                 SSL_write(ssl,response.c_str(),response.size());
                 if (is_logged_in) {
