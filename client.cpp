@@ -12,6 +12,23 @@
 #include <openssl/err.h>
 #include <sys/stat.h>  // For directory creation
 #include <fcntl.h> 
+#include <filesystem> // Include filesystem library
+using namespace std;
+namespace fs = std::__fs::filesystem;
+
+// Function to list files in the user's directory
+void list_files_in_directory(const string &directory) {
+    cout << "Files available in your directory (" << directory << "):\n";
+    try {
+        for (const auto &entry : fs::directory_iterator(directory)) {
+            if (entry.is_regular_file()) {
+                cout << "- " << entry.path().filename().string() << endl;
+            }
+        }
+    } catch (const fs::filesystem_error &err) {
+        cerr << "Error accessing directory: " << err.what() << endl;
+    }
+}
 
 #define PORT 8080
 
@@ -29,6 +46,9 @@ int direct_listen_sock;
 SSL_CTX *client_ctx;        // For outgoing client connections (main server, direct initiate)
 SSL_CTX *direct_server_ctx; // For incoming direct connections (acts as "server" for direct mode)
 SSL *server_ssl;            // For connection to main server
+
+string logged_in_username;
+
 
 static inline void rtrim(string &s) {
     while (!s.empty() && isspace((unsigned char)s.back())) {
@@ -227,6 +247,7 @@ void receive_messages() {
         }
 
         if (message.rfind("SERVER: Online users available for file transfer:", 0) == 0) {
+            cout << "in" << endl;
             // Transfer file
             cout << message << endl;
 
@@ -247,8 +268,19 @@ void receive_messages() {
             cout << response << endl;
             if (response.find("not online") != string::npos) continue;
 
+            string user_directory = "./" + logged_in_username; // Use dynamically determined username
+            list_files_in_directory(user_directory);
+
+            memset(buffer, 0, sizeof(buffer));
+            bytes_read = SSL_read(server_ssl, buffer, sizeof(buffer));
+            if (bytes_read <= 0) {
+                cerr << "Error: Server did not respond.\n";
+                continue;
+            }
+            cout << string(buffer) << endl;
+
             // Prompt for file name
-            cout << "Enter file name to transfer (e.g., a.txt): ";
+            cout << "Enter file name to transfer : ";
             string file_name;
             getline(cin, file_name);
             rtrim(file_name);
@@ -256,7 +288,7 @@ void receive_messages() {
             // Automatically locate the file in ./<username>/<filename>
             string username = "a"; // Replace this with logic to fetch the current username dynamically if available
             string full_file_path = "./" + username + "/" + file_name;
-
+    
             // Send file name to the server
             SSL_write(server_ssl, file_name.c_str(), file_name.size());
 
@@ -294,13 +326,13 @@ void receive_messages() {
             string end_signal = "END_OF_FILE";
             SSL_write(server_ssl, end_signal.c_str(), end_signal.size());
             cout << "File transfer completed for: " << file_name << endl;
+        }
 
-            // Receive confirmation from the server
-            memset(buffer, 0, sizeof(buffer));
-            bytes_read = SSL_read(server_ssl, buffer, sizeof(buffer));
-            if (bytes_read > 0) {
-                cout << string(buffer) << endl;
-            }
+        if (message.rfind("SERVER: File transfer to ", 0) == 0) {
+            cout << message << endl;
+            // Break out of the current context to return to the service selection
+            signal_interaction_finished();
+            continue;
         }
 
 
@@ -321,6 +353,7 @@ void receive_messages() {
             }
             else if (server_message.find("Login successful.") != string::npos) {
                 logged_in = true;
+
                 {
                     lock_guard<mutex> lock(mtx);
                     interacting_with_server = true;
@@ -344,6 +377,13 @@ void receive_messages() {
                 cout << "Enter <username> <password>: ";
                 string credentials;
                 getline(cin, credentials);
+
+                size_t space_pos = credentials.find(' ');
+                if (space_pos != string::npos) {
+                    logged_in_username = credentials.substr(0, space_pos);
+                } else {
+                    logged_in_username.clear(); // Clear if format is unexpected
+                }
                 SSL_write(server_ssl, credentials.c_str(), credentials.size());
             }
             else if (server_message.find("Online users:") != string::npos && 

@@ -399,7 +399,6 @@ void handle_client_ssl(SSL *ssl) {
                 // Receive file data
                 char buffer[1024];
                 while (true) {
-                    cout << "here" << endl;
                     memset(buffer, 0, sizeof(buffer));
                     int bytes_read = SSL_read(ssl, buffer, sizeof(buffer));
                     if (bytes_read <= 0) {
@@ -433,7 +432,7 @@ void handle_client_ssl(SSL *ssl) {
                 // Notify the sender
                 response = "SERVER: File transfer to " + recipient + " completed.\n";
                 SSL_write(ssl, response.c_str(), response.size());
-
+                cout << "here" << endl;
             }
 
 
